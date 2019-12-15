@@ -1,0 +1,296 @@
+public class AppUser : IdentityUser
+{
+   // Add additional profile data for application users by adding properties to this class
+}
+public class AppIdentityDbContextFactory : DesignTimeDbContextFactoryBase<AppIdentityDbContext>
+{
+  protected override AppIdentityDbContext CreateNewInstance(DbContextOptions <AppIdentityDbContext> options)
+  {  
+    return new AppIdentityDbContext(options);
+  }
+}
+
+Startup.cs
+public IServiceProvider ConfigureServices(IServiceCollection services)
+{
+   // Add framework services.
+   services.AddDbContext<AppIdentityDbContext>(options =>  ptions.UseSqlServer(Configuration.GetConnectionString("Default"), b => b.MigrationsAssembly("Web.Api.Infrastructure")));
+...
+   // add identity
+   var identityBuilder = services.AddIdentityCore<AppUser>(o =>
+   {
+     // configure identity options
+     o.Password.RequireDigit = false;
+     o.Password.RequireLowercase = false;
+     o.Password.RequireUppercase = false;
+     o.Password.RequireNonAlphanumeric = false;
+     o.Password.RequiredLength = 6;
+   });
+
+public async Task<CreateUserResponse> Create(string firstName, string lastName, string email, string userName, string password)
+{
+   var appUser = new AppUser {Email = email, UserName = userName};
+   var identityResult = await _userManager.CreateAsync(appUser, password);
+
+   if (!identityResult.Succeeded) return new CreateUserResponse(appUser.Id, false,identityResult.Errors.Select(e  => new Error(e.Code, e.Description)));
+
+   var user = new User(firstName, lastName, appUser.Id, appUser.UserName);
+   _appDbContext.Users.Add(user);
+
+   await _appDbContext.SaveChangesAsync();
+
+   return new CreateUserResponse(appUser.Id, identityResult.Succeeded, identityResult.Succeeded ? null :  identityResult.Errors.Select(e => new Error(e.Code, e.Description)));
+}
+
+public async Task<bool> Handle(RegisterUserRequest message, IOutputPort<RegisterUserResponse> outputPort)
+{
+   var response = await _userRepository.Create(message.FirstName, message.LastName,message.Email, message.UserName, message.Password);
+   outputPort.Handle(response.Success ? new RegisterUserResponse(response.Id, true) : new RegisterUserResponse(response.Errors.Select(e => e.Description)));
+   return response.Success;
+}
+
+// POST api/accounts
+[HttpPost]
+public async Task<ActionResult> Post([FromBody] Models.Request.RegisterUserRequest request)
+{
+  if (!ModelState.IsValid)
+  {
+    return BadRequest(ModelState);
+  }
+  
+  await _registerUserUseCase.Handle(new RegisterUserRequest(request.FirstName,request.LastName,request.Email, request.UserName,request.Password), _registerUserPresenter);
+  return _registerUserPresenter.ContentResult;
+}
+
+public async Task<bool>Handle(LoginRequest message, IOutputPort<LoginResponse> outputPort)
+{
+  if (!string.IsNullOrEmpty(message.UserName) && !string.IsNullOrEmpty(message.Password))
+  {
+    // ensure we have a user with the given user name
+    var user = await _userRepository.FindByName(message.UserName);
+    if (user != null)
+    {
+      // validate password
+      if (await _userRepository.CheckPassword(user, message.Password))
+      {
+        // generate refresh token
+        var refreshToken = _tokenFactory.GenerateToken();
+        user.AddRereshToken(refreshToken, user.Id, message.RemoteIpAddress);
+        await _userRepository.Update(user);
+        // generate access token
+        outputPort.Handle(new LoginResponse(await _jwtFactory.GenerateEncodedToken(user.IdentityId, user.UserName), refreshToken, true));
+        return true;
+       }
+     }
+  }
+  outputPort.Handle(new LoginResponse(new[] { new Error("login_failure", "Invalid username or password.") }));
+  return false;
+}
+
+public async Task<User>FindByName(string userName)
+{
+  var appUser = await _userManager.FindByNameAsync(userName);
+  return appUser == null ? null : _mapper.Map(appUser, await GetSingleBySpec(new UserSpecification(appUser.Id)));
+}
+
+public async Task<bool>CheckPassword(User user, string password)
+{
+  return await _userManager.CheckPasswordAsync(_mapper.Map<AppUser>(user), password);
+}
+
+internal sealed class TokenFactory : ITokenFactory
+{
+  public string GenerateToken(int size=32)
+  {
+    var randomNumber = new byte[size];
+    using (var rng = RandomNumberGenerator.Create())
+    {
+       rng.GetBytes(randomNumber);
+       return Convert.ToBase64String(randomNumber);
+     }
+  }
+}
+
+public void AddRereshToken(string token,int userId,string remoteIpAddress,double daysToExpire=5)
+{
+  _refreshTokens.Add(new RefreshToken(token, DateTime.UtcNow.AddDays(daysToExpire),userId, remoteIpAddress));
+}
+
+
+
+
+public async Task<AccessToken>GenerateEncodedToken(string id, string userName)
+{
+  var identity = GenerateClaimsIdentity(id, userName);
+
+  var claims = new[]
+  {
+    new Claim(JwtRegisteredClaimNames.Sub, userName),
+    new Claim(JwtRegisteredClaimNames.Jti, await _jwtOptions.JtiGenerator()),
+    new Claim(JwtRegisteredClaimNames.Iat, ToUnixEpochDate(_jwtOptions.IssuedAt).ToString(), ClaimValueTypes.Integer64),
+    identity.FindFirst(Helpers.Constants.Strings.JwtClaimIdentifiers.Rol),
+    identity.FindFirst(Helpers.Constants.Strings.JwtClaimIdentifiers.Id)
+  };
+
+  // Create the JWT security token and encode it.
+  var jwt = new JwtSecurityToken(
+  _jwtOptions.Issuer,
+  _jwtOptions.Audience,
+  claims,
+  _jwtOptions.NotBefore,
+  _jwtOptions.Expiration,
+  _jwtOptions.SigningCredentials);
+  return new AccessToken(_jwtTokenHandler.WriteToken(jwt), (int)_jwtOptions.ValidFor.TotalSeconds);
+}
+
+
+//startup.cs
+public IServiceProvider ConfigureServices(IServiceCollection services)
+{
+...
+  // Register the ConfigurationBuilder instance of AuthSettings
+  var authSettings = Configuration.GetSection(nameof(AuthSettings));
+  services.Configure<AuthSettings>(authSettings);
+
+  var signingKey = new SymmetricSecurityKey(Encoding.ASCII.GetBytes(authSettings[nameof(AuthSettings.SecretKey)]));
+
+  // jwt wire up
+  // Get options from app settings
+  var jwtAppSettingOptions = Configuration.GetSection(nameof(JwtIssuerOptions));
+
+  // Configure JwtIssuerOptions
+  services.Configure<JwtIssuerOptions>(options =>
+  {
+    options.Issuer = jwtAppSettingOptions[nameof(JwtIssuerOptions.Issuer)];
+    options.Audience = jwtAppSettingOptions[nameof(JwtIssuerOptions.Audience)];
+    options.SigningCredentials = new SigningCredentials(signingKey, SecurityAlgorithms.HmacSha256);
+  });
+
+  var tokenValidationParameters = new TokenValidationParameters
+  {
+    ValidateIssuer = true,
+    ValidIssuer = jwtAppSettingOptions[nameof(JwtIssuerOptions.Issuer)],
+    ValidateAudience = true,
+    ValidAudience = jwtAppSettingOptions[nameof(JwtIssuerOptions.Audience)],
+    ValidateIssuerSigningKey = true,
+    IssuerSigningKey = signingKey,
+    RequireExpirationTime = false,
+    ValidateLifetime = true,
+    ClockSkew = TimeSpan.Zero
+  };
+
+  services.AddAuthentication(options =>
+  {
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+  }).AddJwtBearer(configureOptions =>
+  {
+    configureOptions.ClaimsIssuer = jwtAppSettingOptions[nameof(JwtIssuerOptions.Issuer)];
+    configureOptions.TokenValidationParameters = tokenValidationParameters;
+    configureOptions.SaveToken = true;
+   });
+
+   // api user claim policy
+   services.AddAuthorization(options =>
+   {
+     options.AddPolicy("ApiUser", policy => policy.RequireClaim(Constants.Strings.JwtClaimIdentifiers.Rol,  Constants.Strings.JwtClaims.ApiAccess));
+   });
+...
+}
+
+
+// POST api/auth/login
+[HttpPost("login")]
+public async Task<ActionResult>Login([FromBody] Models.Request.LoginRequest request)
+{
+  if (!ModelState.IsValid) { return BadRequest(ModelState); }
+  await _loginUseCase.Handle(new LoginRequest(request.UserName, request.Password,   Request.HttpContext.Connection.RemoteIpAddress?.ToString()), _loginPresenter);
+  return _loginPresenter.ContentResult;
+}
+
+[Authorize(Policy = "ApiUser")]
+[Route("api/[controller]")]
+[ApiController]
+public class ProtectedController : ControllerBase
+{
+  // GET api/protected/home
+  [HttpGet]
+  public IActionResult Home()
+  {
+    return new OkObjectResult(new { result = true });
+  }
+}
+
+public IServiceProvider ConfigureServices(IServiceCollection services)
+{
+...
+// api user claim policy
+services.AddAuthorization(options =>
+{
+options.AddPolicy("ApiUser", policy => policy.RequireClaim(Constants.Strings.JwtClaimIdentifiers.Rol, Constants.Strings.JwtClaims.ApiAccess));
+});
+
+// Register the Swagger generator, defining 1 or more Swagger documents
+services.AddSwaggerGen(c =>
+{
+  c.SwaggerDoc("v1", new Info { Title = "AspNetCoreApiStarter", Version = "v1" });
+  // Swagger 2.+ support
+  c.AddSecurityDefinition("Bearer", new ApiKeyScheme
+  {
+    In = "header",
+    Description = "Please insert JWT with Bearer into field",
+    Name = "Authorization",
+    Type = "apiKey"
+  });
+
+  c.AddSecurityRequirement(new Dictionary<string, IEnumerable<string>>
+  {
+    { "Bearer", new string[] { } }
+  });
+});
+
+public async Task<bool>Handle(ExchangeRefreshTokenRequest message,IOutputPort<ExchangeRefreshTokenResponse> outputPort)
+{
+  var cp = _jwtTokenValidator.GetPrincipalFromToken(message.AccessToken, message.SigningKey);
+
+  // invalid token/signing key was passed and we can't extract user claims
+  if (cp != null)
+  {
+    var id = cp.Claims.First(c => c.Type == "id");
+    var user = await _userRepository.GetSingleBySpec(new UserSpecification(id.Value));
+    if (user.HasValidRefreshToken(message.RefreshToken))
+    {
+      var jwtToken = await _jwtFactory.GenerateEncodedToken(user.IdentityId, user.UserName);
+      var refreshToken = _tokenFactory.GenerateToken();
+      user.RemoveRefreshToken(message.RefreshToken); // delete the token we've exchanged
+      user.AddRereshToken(refreshToken, user.Id, ""); // add the new one
+      await _userRepository.Update(user);
+      outputPort.Handle(new ExchangeRefreshTokenResponse(jwtToken, refreshToken, true));
+      return true;
+    }
+}
+  outputPort.Handle(new ExchangeRefreshTokenResponse(false, "Invalid token."));
+  return false;
+}
+
+public bool HasValidRefreshToken(string refreshToken)
+{
+  return _refreshTokens.Any(rt => rt.Token == refreshToken && rt.Active);
+}
+// POST api/auth/refreshtoken
+[HttpPost("refreshtoken")]
+public async Task<ActionResult>RefreshToken([FromBody] Models.Request.ExchangeRefreshTokenRequest request)
+{
+  if (!ModelState.IsValid) { return BadRequest(ModelState);}
+  await _exchangeRefreshTokenUseCase.Handle(new ExchangeRefreshTokenRequest(request.AccessToken, request.RefreshToken, _authSettings.SecretKey), _exchangeRefreshTokenPresenter);
+  return _exchangeRefreshTokenPresenter.ContentResult;
+}
+
+
+
+
+
+
+
+
+
